@@ -82,14 +82,19 @@ class CausalSelfAttention(nn.Module):
             cos, sin = build_rope_cache(config.block_size, head_dim)
             self.register_buffer('rope_cos', cos, persistent=False)
             self.register_buffer('rope_sin', sin, persistent=False)
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
-        # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+
         # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
         self.n_head = config.n_head
+        self.n_kv_head = config.n_kv_head or config.n_head
+        assert self.n_head % self.n_kv_head == 0
         self.n_embd = config.n_embd
+        self.head_dim = config.n_embd // config.n_head
+        self.kv_dim = self.n_kv_head * self.head_dim
+        self.c_attn = nn.Linear(config.n_embd, config.n_embd + 2 * self.kv_dim, bias=config.bias)
+        # output projection
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = config.dropout
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
@@ -103,14 +108,19 @@ class CausalSelfAttention(nn.Module):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q, k, v = self.c_attn(x).split([self.n_embd, self.kv_dim, self.kv_dim], dim=2)
+
+        k = k.view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)  # (B, 3, T, hs)
+        q = q.view(B, T, self.n_head,    self.head_dim).transpose(1, 2)  # (B, 6, T, hs)
+        v = v.view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
         if self.use_rope:
             q = apply_rope(q, self.rope_cos[:T], self.rope_sin[:T])
             k = apply_rope(k, self.rope_cos[:T], self.rope_sin[:T])
 
+        rep = self.n_head // self.n_kv_head
+        if rep > 1:
+            k = k.repeat_interleave(rep, dim=1)
+            v = v.repeat_interleave(rep, dim=1)
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
@@ -163,6 +173,7 @@ class GPTConfig:
     pos_type: str = 'learned'
     norm_type: str = 'layernorm'
     mlp_type: str = 'gelu'  # 'gelu' or 'swiglu'
+    n_kv_head: int = 0
     block_size: int = 1024
     vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer: int = 12
@@ -178,6 +189,10 @@ class GPT(nn.Module):
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
+        assert config.norm_type in ('layernorm', 'rmsnorm'), f"bad norm_type: {config.norm_type}"
+        assert config.mlp_type  in ('gelu', 'swiglu'),       f"bad mlp_type: {config.mlp_type}"
+        assert config.pos_type  in ('learned', 'nope', 'rope'), f"bad pos_type: {config.pos_type}"
+
         modules = dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             drop = nn.Dropout(config.dropout),

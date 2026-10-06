@@ -26,6 +26,18 @@ class LayerNorm(nn.Module):
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
+class SwiGLUMLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        hidden = int(8 * config.n_embd / 3)   # 384 -> 1024
+        self.w1     = nn.Linear(config.n_embd, hidden, bias=config.bias)  # 主分支
+        self.w3     = nn.Linear(config.n_embd, hidden, bias=config.bias)  # 门控分支
+        self.c_proj = nn.Linear(hidden, config.n_embd, bias=config.bias)  # 输出投影
+        self.dropout = nn.Dropout(config.dropout)
+
+    def forward(self, x):
+        return self.dropout(self.c_proj(F.silu(self.w1(x)) * self.w3(x)))
+
 class RMSNorm(nn.Module):
     def __init__(self, ndim, eps=1e-5):
         super().__init__()
@@ -115,7 +127,7 @@ class Block(nn.Module):
         self.ln_1 = make_norm(config)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = make_norm(config)
-        self.mlp = MLP(config)
+        self.mlp = SwiGLUMLP(config) if config.mlp_type == 'swiglu' else MLP(config)
 
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))
@@ -125,6 +137,7 @@ class Block(nn.Module):
 @dataclass
 class GPTConfig:
     norm_type: str = 'layernorm'
+    mlp_type: str = 'gelu'  # 'gelu' or 'swiglu'
     block_size: int = 1024
     vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer: int = 12

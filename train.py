@@ -50,7 +50,7 @@ batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch si
 block_size = 1024
 # model
 norm_type = 'layernorm'
-mlp_type = 'mlp'
+mlp_type = 'gelu'
 n_layer = 12
 n_head = 12
 n_embd = 768
